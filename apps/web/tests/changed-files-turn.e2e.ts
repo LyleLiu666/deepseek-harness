@@ -727,6 +727,27 @@ describe('web e2e: a git workspace turn ends with its changed files', () => {
     await compareOrRefreshGolden(join(DIR, 'ui.expected.md'), aria, MODE)
   })
 
+  it.skipIf(MODE === 'record')('opens the same-named file from the turn directory in the sidebar', async () => {
+    const turnCwd = await mkdtemp(join(cwd, 'turn-directory-'))
+    onTestFinished(async () => { await rm(turnCwd, { recursive: true, force: true }) })
+    await writeFile(join(turnCwd, 'notes.txt'), 'from the turn directory\n')
+    const preview = await page.context().newPage()
+    onTestFinished(async () => { await preview.close() })
+    await preview.route('**/api/changes.summary?*', async (route) => {
+      const response = await route.fetch()
+      const summary = await response.json() as ChangesSummary
+      await route.fulfill({ response, json: { ...summary, cwd: turnCwd } })
+    })
+    await preview.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+    const row = preview.locator('[data-changed-files]').getByRole('button', { name: '查看 notes.txt 的改动' })
+    await expect.poll(() => row.getAttribute('aria-describedby')).not.toBeNull()
+    const description = await row.getAttribute('aria-describedby')
+    expect(await preview.locator(`[id="${description}"]`).textContent()).toBe(join(turnCwd, 'notes.txt'))
+    await row.click()
+    await preview.locator('[data-changes-review] [data-review-tool="open-file"]').click()
+    await preview.locator('[data-textpreview-body]').getByText('from the turn directory', { exact: true }).waitFor()
+  })
+
   it('preserves filename endings when the review narrows and updates the fade after resizing or selecting another file', async () => {
     const preview = await page.context().newPage()
     onTestFinished(async () => { await preview.close() })
