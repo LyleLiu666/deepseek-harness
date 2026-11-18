@@ -105,7 +105,13 @@ export class RepositoryCleaner {
     const canonicalRoot = await realpath(this.root)
 
     await this.addIfPresent(targets, join(this.root, '.dsh-build'), canonicalRoot)
-    await this.addIfPresent(targets, join(this.root, 'apps/desktop/.desktop-build'), canonicalRoot)
+    const desktopBuild = join(this.root, 'apps/desktop/.desktop-build')
+    for (const name of ['home', 'electron-user-data']) {
+      if (await exists(join(desktopBuild, 'development', name))) {
+        throw new Error('clean: legacy Desktop development state is still in .desktop-build/development. Close Harness Dev and launch the updated Desktop once to migrate its default state, or move the legacy state to a safe location before cleaning.')
+      }
+    }
+    await this.addIfPresent(targets, desktopBuild, canonicalRoot)
 
     // These checks cover legacy root-level incremental state emitted by older configs.
     await this.addIfPresent(targets, join(this.root, '.typecheck'), canonicalRoot)

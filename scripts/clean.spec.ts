@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -37,6 +37,19 @@ afterEach(() => {
 })
 
 describe('RepositoryCleaner', () => {
+  it.each(['home', 'electron-user-data'])('keeps legacy desktop %s if clean runs before migration', async (name) => {
+    const root = fixture()
+    addProject(root, 'products/shell')
+    const state = join(root, 'apps/desktop/.desktop-build/development', name, 'saved-state')
+    const output = join(root, '.dsh-build/build.json')
+    write(state, 'saved state')
+    write(output)
+
+    await expect(new RepositoryCleaner(root).clean()).rejects.toThrow('legacy Desktop development state')
+    expect(readFileSync(state, 'utf8')).toBe('saved state')
+    expect(existsSync(output)).toBe(true)
+  })
+
   it('derives live build outputs from project references and removes safe stale package residue', async () => {
     const root = fixture()
     addProject(root, 'products/shell')
@@ -44,6 +57,9 @@ describe('RepositoryCleaner', () => {
     write(join(root, 'products/shell/lib/index.js'))
     write(join(root, '.typecheck/legacy.tsbuildinfo'))
     write(join(root, '.dsh-build/client-build-environment.json'))
+    write(join(root, 'apps/desktop/.desktop-build/development/project/package.json'))
+    const desktopState = join(root, 'apps/desktop/.desktop-dev/home/saved-state')
+    write(desktopState, 'saved state')
     write(join(root, 'apps/desktop/renderer/assets/welcome-brand.svg'))
     write(join(root, 'apps/desktop/renderer/assets/welcome-loading.svg'))
     write(join(root, 'apps/desktop/renderer/welcome.css'))
@@ -56,6 +72,8 @@ describe('RepositoryCleaner', () => {
     expect(existsSync(join(root, 'products/shell/src/index.ts'))).toBe(true)
     expect(existsSync(join(root, '.typecheck'))).toBe(false)
     expect(existsSync(join(root, '.dsh-build'))).toBe(false)
+    expect(existsSync(join(root, 'apps/desktop/.desktop-build'))).toBe(false)
+    expect(readFileSync(desktopState, 'utf8')).toBe('saved state')
     expect(existsSync(join(root, 'apps/desktop/renderer/assets/welcome-brand.svg'))).toBe(true)
     expect(existsSync(join(root, 'apps/desktop/renderer/assets/welcome-loading.svg'))).toBe(true)
     expect(existsSync(join(root, 'apps/desktop/renderer/welcome.css'))).toBe(true)
