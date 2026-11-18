@@ -141,6 +141,13 @@ describe('Windows durable namespace helpers', () => {
     expect(readFileSync(final, 'utf8')).toBe('content')
   })
 
+  it('requests same-volume write-through replacement for torn-tail recovery', async () => {
+    const move = vi.fn(() => 1)
+    const { replaceFileWin32 } = await importWithMove(move)
+    await replaceFileWin32('staged', 'current')
+    expect(move).toHaveBeenCalledWith(expect.any(String), expect.any(String), MOVEFILE_WRITE_THROUGH | 1, expect.any(Function))
+  })
+
   it('maps Win32 publish failures to Node-style errno codes', async () => {
     const cases = [
       [ERROR_FILE_NOT_FOUND, 'ENOENT'],

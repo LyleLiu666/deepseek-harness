@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -629,8 +629,7 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
     expect(loaded.events[6]).toEqual(openTurn[0])
     expect(loaded.events[7]).toEqual(openTurn[1])
 
-    // The first append truncates the torn bytes and rewrites the recovered
-    // records durably before the new batch, continuing at their next-seq.
+    // A durable repair keeps the committed frames byte-identical and admits the new batch at seq 8.
     const closers: SessionEvent[] = [
       { type: 'step/end', seq: SessionSeq(8), time: 10, data: { turn: 2, step: 1 } },
       { type: 'turn/end', seq: SessionSeq(9), time: 11, data: { turn: 2, reason: { kind: 'interrupted' } } },
@@ -645,53 +644,113 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
       .toEqual([...oneTurnLog(), openTurn[0]!, openTurn[1]!, ...closers])
   })
 
-  it('retries the torn-tail rewrite when its first durable write fails', async () => {
+  async function recoverableTail() {
     const root = await freshRoot()
     const ctx = await mount(root)
     const header = meta('retry-torn-rewrite', '/proj')
-    vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
     await writeLog(ctx.sessionPersistence, header, oneTurnLog())
     const path = logPath(root, header.cwd, header.id, 'zstd')
     const recovered: SessionEvent[] = [
       { type: 'turn/start', seq: SessionSeq(6), time: 7, data: { turn: 2 } },
       { type: 'step/start', seq: SessionSeq(7), time: 8, data: { turn: 2, step: 1 } },
-      {
-        type: 'assistant/attempt',
-        seq: SessionSeq(8),
-        time: 9,
-        data: {
-          turn: 2,
-          step: 1,
-          stream: [{ type: 'text-chunks', time0: 9, index: 0, dt: [], texts: [deterministicNoise(300_000)] }],
-        },
-      },
     ]
-    await appendFile(path, await tornFrame(recovered.map(e => JSON.stringify(e)).join('\n') + '\n', (decoded) => {
-      const newlines = decoded.match(/\n/g)?.length ?? 0
-      return newlines >= 2 && !decoded.endsWith('\n')
-    }))
+    const frame = await compressZstdFrame(recovered.map(e => JSON.stringify(e)).join('\n') + '\n')
+    await appendFile(path, frame.subarray(0, -1))
+    const expected = [...oneTurnLog(), ...recovered]
+    const closers: SessionEvent[] = [
+      { type: 'step/end', seq: SessionSeq(8), time: 10, data: { turn: 2, step: 1 } },
+      { type: 'turn/end', seq: SessionSeq(9), time: 11, data: { turn: 2, reason: { kind: 'interrupted' } } },
+    ]
+    return { root, ctx, header, path, expected, closers }
+  }
 
+  it('leaves unrelated repair-named siblings intact', async () => {
+    const { ctx, header, path, closers } = await recoverableTail()
+    const sideFile = path + '.repair.tmp'
+    await writeFile(sideFile, 'manual recovery notes')
+    await appendBatch(ctx.sessionPersistence, header.id, closers)
+    expect(await readFile(sideFile, 'utf8')).toBe('manual recovery notes')
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('requires write access to the current file before replacing its torn tail', async () => {
+    const { ctx, header, path, closers } = await recoverableTail()
+    const before = await readFile(path)
+    await chmod(path, 0o400)
+    try {
+      await expect(appendBatch(ctx.sessionPersistence, header.id, closers)).rejects.toMatchObject({ code: 'EACCES' })
+      expect(await readFile(path)).toEqual(before)
+      expect((await stat(path)).mode & 0o777).toBe(0o400)
+    } finally {
+      await chmod(path, 0o600)
+    }
+  })
+
+  it.each(['none', 'zstd'] as const)('retries an in-place tail truncation on the same handle after a sync failure (%s)', async (compression) => {
+    const root = await freshRoot()
+    const ctx = await mount(root, compression)
+    const header = meta('empty-torn-tail')
+    await writeLog(ctx.sessionPersistence, header, oneTurnLog())
+    const path = logPath(root, header.cwd, header.id, compression)
+    await appendFile(path, compression === 'none' ? '{"partial":' : MAGIC.subarray(0, 2))
+    const writer = await ctx.sessionPersistence.open(header.id, 'write')
+    const next: SessionEvent[] = [{ type: 'turn/start', seq: SessionSeq(6), time: 7, data: { turn: 2 } }]
+    try {
+      const probe = await open(path, 'r')
+      const prototype = Object.getPrototypeOf(probe) as { sync: () => Promise<void> }
+      await probe.close()
+      vi.spyOn(prototype, 'sync').mockRejectedValueOnce(new Error('truncate sync failed'))
+      await expect(writer.append(next)).rejects.toThrow('truncate sync failed')
+      await writer.append(next)
+    } finally {
+      await writer.close()
+    }
+    expect((await readAll(ctx.sessionPersistence, header.id)).events).toEqual([...oneTurnLog(), ...next])
+  })
+
+  it.each([
+    'stage-sync', 'verify', 'source-change', 'reopen',
+    ...(process.platform === 'win32' ? [] : ['directory-sync']),
+  ])('preserves readable tail records after a failed repair (%s)', async (fault) => {
+    const { root, ctx, header, path, expected, closers } = await recoverableTail()
+    const before = await readFile(path)
+    expect((await readAll(ctx.sessionPersistence, header.id)).events).toEqual(expected)
+    const reopen = ['directory-sync', 'source-change', 'reopen'].includes(fault)
     const handle = await ctx.sessionPersistence.open(header.id, 'write')
     try {
-      const failure = new Error('rewrite refused')
-      const service = ctx.sessionPersistence as unknown as { persistBatch: () => Promise<void> }
-      vi.spyOn(service, 'persistBatch').mockRejectedValueOnce(failure)
-      const closers: SessionEvent[] = [
-        { type: 'step/end', seq: SessionSeq(8), time: 10, data: { turn: 2, step: 1 } },
-        { type: 'turn/end', seq: SessionSeq(9), time: 11, data: { turn: 2, reason: { kind: 'interrupted' } } },
-      ]
-      // The rewrite of the recovered records fails first; the retained repair
-      // state makes the retried append rewrite them exactly once.
-      await expect(handle.append(closers)).rejects.toBe(failure)
-      await handle.append(closers)
+      const probe = await open(path, 'r')
+      const prototype = Object.getPrototypeOf(probe) as { sync: () => Promise<void> }
+      await probe.close()
+      const sync = prototype.sync
+      vi.spyOn(prototype, 'sync').mockImplementation(async function (this: FileHandle) {
+        if (fault === 'directory-sync') {
+          if ((await this.stat()).isDirectory()) throw new Error('directory sync failed')
+        } else if (fault === 'verify') {
+          await this.truncate(0)
+        } else if (fault === 'source-change') {
+          await utimes(path, new Date(0), new Date(0))
+        } else {
+          throw new Error('file sync failed')
+        }
+        await sync.call(this)
+      })
+      await expect(handle.append(closers)).rejects.toThrow(/sync failed|verification failed|changed during torn-tail repair/)
+      vi.restoreAllMocks()
+      if (fault !== 'directory-sync') expect(await readFile(path)).toEqual(before)
+      expect((await readAll((await mount(root)).sessionPersistence, header.id)).events).toEqual(expected)
+      if (fault === 'directory-sync' || fault === 'source-change') {
+        await expect(handle.append(closers)).rejects.toThrow(/reopen/)
+      } else if (!reopen) {
+        await handle.append(closers)
+      }
     } finally {
+      vi.restoreAllMocks()
       await handle.close()
     }
-
-    const repaired = await readFile(path)
-    expect(scanZstdFrames(repaired).tornStart).toBeUndefined()
-    expect(scanLog(await decodeCompleteFrames(repaired)).events.map(e => e.seq))
-      .toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    if (reopen) {
+      await ctx.fiber.dispose()
+      await appendBatch((await mount(root)).sessionPersistence, header.id, closers)
+    }
+    expect((await readAll((await mount(root)).sessionPersistence, header.id)).events).toEqual([...expected, ...closers])
   })
 
   it('drops a frame torn in its header before it has produced plaintext', async () => {

@@ -35,6 +35,13 @@ import type { SessionWriteLease } from './lease.ts'
 /** Maximum intentional wait before a routed live session batch starts writing. */
 export const LIVE_WRITE_BATCH_MAX_DELAY_MS = 200
 
+/** Repair inputs captured together from one leased current-file revision. */
+export interface TornTailRepair {
+  readonly prefixBytes: number
+  readonly recovered: readonly SessionEvent[]
+  readonly revision: SessionPersistenceRevision
+}
+
 /** The file-storage primitives the handle drives on its owning service. */
 export interface JsonlHandleStorage {
   /** Append encoded lines; `isMaterialized` selects create-vs-extend publication. */
@@ -46,8 +53,8 @@ export interface JsonlHandleStorage {
   ): Promise<void>
   /** Materialize the header-only artifact for an explicitly flushed empty session. */
   persistHeader(header: SessionHeader, inheritedEventCount: SessionLogOffset): Promise<void>
-  /** Truncate a torn physical tail before the first new append lands. */
-  truncateTornTail(header: SessionHeader, truncateTo: number): Promise<void>
+  /** Durably repair a torn tail, retaining every recovered record before admitting a new batch. */
+  repairTornTail(header: SessionHeader, repair: TornTailRepair): Promise<void>
   /** Resolve the current-generation artifact path, or `undefined` when absent. */
   resolveCurrentLog(id: SessionId, signal?: AbortSignal): Promise<string | undefined>
   /** Read and validate the stored log at `path`, including its established event aliasing state. */
@@ -66,10 +73,8 @@ export interface StorageHandleState {
   cursor: number
   /** Whether the session has a durable artifact yet. */
   materialized: boolean
-  /** Torn-tail truncation point, consumed by the first new append. */
-  tornTruncateTo?: number | undefined
-  /** Complete events recovered from the torn final frame; the first mutation rewrites them durably. */
-  recoveredTail?: SessionEvent[] | undefined
+  /** Physical repair required before the next batch can extend this handle's logical cursor. */
+  repair?: TornTailRepair | undefined
   /** Exact fork-inherited prefix length stored with the log; `0` when unseeded. */
   inheritedEventCount: SessionLogOffset
   /** The validated stored prefix from a write open, served to reads until the first append. */
@@ -321,19 +326,9 @@ export class JsonlSessionHandle implements SessionHandle {
     if (batch.length === 0) return
     await this.ensureLease()
     assertContiguous(this.id, batch, this.state.cursor)
-    // Commit any pending torn-tail repair first, clearing each step's state
-    // only once it lands so a failed step retries on the next mutation:
-    // truncate the torn bytes, then durably rewrite the complete events
-    // recovered from them (already counted in the primed cursor).
-    if (this.state.tornTruncateTo !== undefined) {
-      await this.storage.truncateTornTail(this.header, this.state.tornTruncateTo)
-      this.state.tornTruncateTo = undefined
-    }
-    if (this.state.recoveredTail !== undefined) {
-      if (this.state.recoveredTail.length > 0) {
-        await this.storage.persistBatch(this.header, this.state.recoveredTail, this.state.materialized, this.state.inheritedEventCount)
-      }
-      this.state.recoveredTail = undefined
+    if (this.state.repair !== undefined) {
+      await this.storage.repairTornTail(this.header, this.state.repair)
+      this.state.repair = undefined
     }
     await this.storage.persistBatch(this.header, batch, this.state.materialized, this.state.inheritedEventCount)
     this.state.materialized = true

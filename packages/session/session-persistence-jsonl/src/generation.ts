@@ -275,6 +275,10 @@ async function readStableSnapshot(
       return { bytes, identity: after }
     }
     if (attempt === 1) {
+      // A prefix length from the replaced inode cannot delimit frames in a repaired log.
+      if (before.dev !== after.dev || before.ino !== after.ino) {
+        throw new Error(`Session log replaced during read; retry "${path}"`)
+      }
       return { bytes: bytes.subarray(0, Number(before.size)), identity: before }
     }
     before = after

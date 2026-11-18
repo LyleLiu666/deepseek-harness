@@ -25,8 +25,7 @@ import SessionStore from '@deepseek-ai/dsh-session'
 const statRace = vi.hoisted(() => ({
   path: undefined as string | undefined,
   reads: 0,
-  /** 'settle': the revision changes once and then holds; 'churn': every stat differs. */
-  mode: 'settle' as 'settle' | 'churn',
+  mode: 'settle' as 'settle' | 'churn' | 'replaced',
 }))
 
 const statFailure = vi.hoisted(() => ({
@@ -94,6 +93,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       const identity = await actual.stat(...args)
       if (String(args[0]) !== statRace.path || !('mtimeNs' in identity)) return identity
       statRace.reads += 1
+      if (statRace.mode === 'replaced') return { ...identity, ino: identity.ino + BigInt(statRace.reads) }
       if (statRace.mode === 'churn') return { ...identity, mtimeNs: identity.mtimeNs + BigInt(statRace.reads) }
       if (statRace.reads < 3) return identity
       return { ...identity, mtimeNs: identity.mtimeNs + 1n }
@@ -1670,6 +1670,20 @@ describe('JsonlSessionPersistence: durability and crash semantics', () => {
       // post-read stat per bounded attempt.
       expect((await handle.read()).events).toEqual(oneTurnLog())
       expect(statRace.reads).toBe(4)
+    } finally {
+      statRace.path = undefined
+      await handle.close()
+    }
+  })
+
+  it('refuses an unstable read across file replacement instead of slicing it to the previous file size', async () => {
+    const m = meta('read-repair-replace', '/work')
+    await writeLog(ctx.sessionPersistence, m, oneTurnLog())
+    const handle = await ctx.sessionPersistence.open(m.id, 'read')
+    try {
+      statRace.mode = 'replaced'
+      statRace.path = rawLogPath(root, '/work', m.id)
+      await expect(handle.read()).rejects.toThrow('Session log replaced during read')
     } finally {
       statRace.path = undefined
       await handle.close()
