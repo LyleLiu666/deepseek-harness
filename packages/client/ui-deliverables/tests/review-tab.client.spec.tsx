@@ -37,7 +37,7 @@ const ADDRESS = changesReviewAddress(COORDINATES)
 const SUMMARY_URL = changesSummaryUrl(SESSION, 5)
 
 const summary: ChangesSummary = {
-  turn: 2, total: 4, added: 4, deleted: 2,
+  turn: 2, cwd: '/work/app', total: 4, added: 4, deleted: 2,
   files: [
     { path: 'src/app/main.ts', display: 'src/app/main.ts', added: 3, deleted: 1 },
     { path: '/tmp/out/big.bin', display: '~/out/big.bin', added: 0, deleted: 0, oversized: true },
@@ -328,6 +328,19 @@ describe('ReviewTab', () => {
     expect(view.container.querySelector('[data-diff-code]')).toBeNull()
     expect(view.getByText('before')).toBeTruthy()
     expect(view.getByText('after')).toBeTruthy()
+  })
+
+  it('opens a changed file from its turn directory when the session is elsewhere', () => {
+    const summaries = new ChangesSummaryStore()
+    const turn = {
+      ...summary,
+      cwd: '/work/app/topic',
+      files: [{ path: 'notes.txt', display: 'notes.txt', added: 1, deleted: 1 }],
+    }
+    summaries.state.set({ [SUMMARY_URL]: turn })
+    const { view, tabActions } = mount({ summaries })
+    fireEvent.click(view.getByRole('button', { name: 'Open notes.txt in sidebar' }))
+    expect(tabActions.openResource).toHaveBeenCalledWith(fileAddressFor(SESSION, undefined, '/work/app/topic/notes.txt'))
   })
 
   it('opens the whole file in the sidebar and the native open only with a desktop', () => {
