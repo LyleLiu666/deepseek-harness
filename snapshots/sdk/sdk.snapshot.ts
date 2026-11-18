@@ -9,8 +9,9 @@
  * fixtures and rewrites expected outputs.
  */
 
+import { readCompressedLog } from './session-resume/recovery-fixture.ts'
 import { existsSync } from 'node:fs'
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -341,15 +342,15 @@ interface PersistedLog {
   readonly header: Record<string, unknown>
 }
 
-async function jsonlFiles(dir: string): Promise<string[]> {
+async function jsonlFiles(dir: string, compressed = false): Promise<string[]> {
   const entries = await readdir(dir, { recursive: true })
-  return latestPersistedSessionPaths(entries).map(entry => join(dir, entry))
+  return latestPersistedSessionPaths(entries, compressed ? 'zstd' : 'raw').map(entry => join(dir, entry))
 }
 
-async function persistedLogs(sessionsRoot: string): Promise<PersistedLog[]> {
-  const files = await jsonlFiles(sessionsRoot)
+async function persistedLogs(sessionsRoot: string, compressed = false): Promise<PersistedLog[]> {
+  const files = await jsonlFiles(sessionsRoot, compressed)
   return Promise.all(files.map(async (path) => {
-    const content = await readFile(path, 'utf8')
+    const content = compressed ? await readCompressedLog(path) : await readFile(path, 'utf8')
     expect(assertPersistedSessionVersion(basename(path), content), `${path}: current writer`).toBe(SESSION_FORMAT_VERSION)
     const header = JSON.parse(content.slice(0, content.indexOf('\n'))) as Record<string, unknown>
     return { path, content, header }
@@ -731,7 +732,7 @@ function authoredPatches(scenario: CorpusScenario, replaying: boolean): string[]
 }
 
 /** One SDK-controlled recorded scenario against a fresh SDK-profile subprocess. */
-async function runScenario(scenario: CorpusScenario): Promise<{
+async function runScenario(scenario: CorpusScenario, recovery = false): Promise<{
   results: RunResult[]
   notifications: HarnessNotification[]
   observedMethods: ReadonlySet<string>
@@ -766,6 +767,7 @@ async function runScenario(scenario: CorpusScenario): Promise<{
     ...legacySdkCompositions.has(scenario.manifest.composition) ? [legacySdkContextPatch] : [],
     ...authoredPatches(scenario, !recording),
     ...assertions.patches ?? [],
+    ...recovery ? [join(scenario.dir, 'recovery.cordis.yml')] : [],
     ...scenario.name === 'session-resume' && !recording ? [join(scenario.dir, 'replay.cordis.yml')] : [],
   ]
     .map((patch, index) => materializeProfilePatch(patch, cwd, scenario.manifest.profile, patchRoot, index))
@@ -931,6 +933,13 @@ async function runScenario(scenario: CorpusScenario): Promise<{
         if (scenario.name === 'session-resume' && results.length > 0) {
           subscription.close()
           await harness.close()
+          if (recovery) {
+            const files = await jsonlFiles(sessionsRoot, true)
+            expect(files).toHaveLength(1)
+            const path = files[0]!
+            // Remove the final checksum byte, leaving the last frame's complete records recoverable.
+            await truncate(path, (await stat(path)).size - 1)
+          }
           await prepareTurnReplay(action.turn)
           harness = createHarness('deepseek-v4-pro')
           await harness.start()
@@ -1021,7 +1030,7 @@ async function runScenario(scenario: CorpusScenario): Promise<{
     }
     await harness.close()
     const logs = (await Promise.all([
-      persistedLogs(sessionsRoot),
+      persistedLogs(sessionsRoot, recovery),
       ...(childSessionsRoot === undefined ? [] : [persistedLogs(childSessionsRoot)]),
     ])).flat()
     const finalWorkspace = await captureWorkspaceSnapshot(cwd, {
@@ -1175,12 +1184,15 @@ describe('TypeScript SDK snapshots over the jsonrpc runtime', () => {
     expect(await readFile(path, 'utf8')).toBe(fixture)
   })
 
-  for (const scenario of sdkScenarios) {
+  for (const { scenario, recovery } of sdkScenarios.flatMap(scenario => [
+    { scenario, recovery: false },
+    ...scenario.name === 'session-resume' && !recording && !refreshing ? [{ scenario, recovery: true }] : [],
+  ])) {
     const scenarioTest = recording
       && (scenario.manifest.recording === 'authored' || scenario.manifest.sessionFormat !== undefined)
       ? it.skip
       : it
-    scenarioTest(`${mode}s ${scenario.name} through dsh --profile ${scenario.manifest.profile}`, async () => {
+    scenarioTest(`${mode}s ${scenario.name} through dsh --profile ${scenario.manifest.profile}${recovery ? ' after a torn compressed write' : ''}`, async () => {
       const scenarioDir = scenario.dir
       const retained = scenario.manifest.sessionFormat !== undefined
       const notificationsExpectedPath = join(scenarioDir, retained ? 'notifications.current.expected.jsonl' : 'notifications.expected.jsonl')
@@ -1196,7 +1208,7 @@ describe('TypeScript SDK snapshots over the jsonrpc runtime', () => {
         expect(writerFiles, 'native writer oracle inventory').toEqual(retained
           ? files.map((_, index) => writerSnapshotName(index)).sort() : [])
       }
-      const { results, notifications, observedMethods, logs, initialWorkspace, finalWorkspace, cwd, modelRequests } = await runScenario(scenario)
+      const { results, notifications, observedMethods, logs, initialWorkspace, finalWorkspace, cwd, modelRequests } = await runScenario(scenario, recovery)
       const ordered = orderLogs(
         logs,
         recording ? logs.length : files.length,

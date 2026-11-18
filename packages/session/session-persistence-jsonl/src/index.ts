@@ -13,8 +13,8 @@ import {
   SessionFormatUnsupportedMigrationError,
   sessionFormatCatalog,
 } from '@deepseek-ai/dsh-session-format-catalog'
-import { readdirSync, type Dirent } from 'node:fs'
-import { open, mkdir, readdir, realpath, link, rm, stat, truncate } from 'node:fs/promises'
+import { createReadStream, readdirSync, type Dirent } from 'node:fs'
+import { open, mkdir, readdir, realpath, link, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { scheduler } from 'node:timers/promises'
@@ -32,7 +32,7 @@ import {
   type SessionPersistenceSnapshot, type SessionPersistenceStatOptions,
   type SessionPersistenceRevision as PersistenceRevision,
 } from '@deepseek-ai/dsh-session-persistence'
-import { JsonlBackendTracker, JsonlSessionHandle, type StorageHandleState } from './storage.ts'
+import { JsonlBackendTracker, JsonlSessionHandle, type StorageHandleState, type TornTailRepair } from './storage.ts'
 import { SessionWriteLease } from './lease.ts'
 import { SESSION_FORMAT_VERSION, SessionId as makeSessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionId, SessionHeader, SessionLogOffset as SessionLogOffsetType } from '@deepseek-ai/dsh-session'
@@ -44,7 +44,7 @@ import {
 import {
   compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
 } from './zstd.ts'
-import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
+import { ensureDurableDirectoryWin32, publishNewFileWin32, replaceFileWin32 } from './win32.ts'
 import { verifyCurrentGenerationInWorker } from './migration-verifier.ts'
 import { prepareCatalogFacts } from './catalog-migration.ts'
 import {
@@ -426,6 +426,9 @@ class JsonlSessionPersistence extends SessionPersistence {
       const resolved = await this.findLog(id, options?.signal)
       if (resolved === undefined) throw new SessionPersistenceNotFoundError(id)
       lease = await this.acquireLease(id, undefined, dirname(resolved.currentPath))
+      // A previous writer may have published a repair but exited before syncing the directory.
+      // Make that name durable before this writer can acknowledge an append to the repaired inode.
+      if (this.compression === 'zstd' && process.platform !== 'win32') await this.syncDirPosix(dirname(resolved.currentPath))
       const prepared = await this.requireStoredLog(id, options?.signal)
       options?.signal?.throwIfAborted()
       let stored: CurrentStoredLog
@@ -438,8 +441,9 @@ class JsonlSessionPersistence extends SessionPersistence {
       return this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, 'write', {
         cursor: stored.events.length,
         materialized: true,
-        tornTruncateTo: stored.tornTruncateTo,
-        recoveredTail: stored.recoveredTail,
+        repair: stored.tornTruncateTo === undefined ? undefined : {
+          prefixBytes: stored.tornTruncateTo, recovered: stored.recoveredTail, revision: stored.revision,
+        },
         inheritedEventCount: stored.inheritedEventCount,
         primed: stored,
       }, lease))
@@ -937,13 +941,18 @@ class JsonlSessionPersistence extends SessionPersistence {
   }
 
   /**
-   * Truncate a torn physical tail durably before this session's first new append.
+   * Repair a torn tail while the caller holds the session write lease.
    * @param header - the session's stored header.
-   * @param truncateTo - the byte offset the artifact is truncated to.
+   * @param repair - intact prefix length and recoverable records from the leased file revision.
    */
-  async truncateTornTail(header: SessionHeader, truncateTo: number): Promise<void> {
+  async repairTornTail(header: SessionHeader, repair: TornTailRepair): Promise<void> {
     this.coldLogMemo.delete(header.id)
-    await this.repair(header, truncateTo)
+    const path = logPath(this.root, header.cwd, header.id, this.compression)
+    if (repair.recovered.length === 0) {
+      await this.rollbackAppend(path, repair.prefixBytes)
+    } else {
+      await this.replaceRecoveredTail(path, repair)
+    }
     this.ctx.logger.warn(`${this.name}: session "${header.id}" recovered from a torn tail; incomplete tail bytes were discarded`)
   }
 
@@ -1044,9 +1053,8 @@ class JsonlSessionPersistence extends SessionPersistence {
           recoveredTail: [],
         }
       }
-      // A torn final frame's append never resolved, but complete JSONL records
-      // already flushed into it are real emitted events: recover them, and let
-      // the write path truncate the torn bytes and rewrite them durably.
+      // Complete records from the torn frame belong to the readable history,
+      // including while the next writer repairs the file.
       let recoveredPlaintext: Buffer = Buffer.alloc(0)
       try {
         signal?.throwIfAborted()
@@ -1450,15 +1458,46 @@ class JsonlSessionPersistence extends SessionPersistence {
     }
   }
 
-  /** Truncate the log file to `offset` bytes and fsync (discard the crash tail). */
-  private async repair(meta: SessionHeader, offset: number): Promise<void> {
-    const path = logPath(this.root, meta.cwd, meta.id, this.compression)
-    await truncate(path, offset)
-    const handle = await open(path, 'r+')
+  /** Publish a byte-verified copy of the intact prefix and recovered frame under the write lease. */
+  private async replaceRecoveredTail(path: string, repair: TornTailRepair): Promise<void> {
+    if (fileRevision(await stat(path, { bigint: true })) !== repair.revision) {
+      throw new Error(`Session log changed since torn-tail recovery; reopen "${path}" before appending`)
+    }
+    const tail = await this.encodeEventBatch(repair.recovered)
+    const tmp = `${path}.${randomBytes(6).toString('hex')}.repair.tmp`
+    const staged = await open(tmp, 'wx', 0o600)
     try {
-      await handle.sync()
-    } finally {
-      await handle.close()
+      const expected = createHash('sha256')
+      try {
+        // Replacing an entry in a writable directory must still require write access to the log.
+        const prefix: AsyncIterable<Buffer> = createReadStream(path, { flags: 'r+', end: repair.prefixBytes - 1 })
+        for await (const chunk of prefix) {
+          expected.update(chunk)
+          await staged.writeFile(chunk)
+        }
+        expected.update(tail)
+        await staged.writeFile(tail)
+        await staged.sync()
+      } finally {
+        await staged.close()
+      }
+      const actual = createHash('sha256')
+      const candidate: AsyncIterable<Buffer> = createReadStream(tmp)
+      for await (const chunk of candidate) actual.update(chunk)
+      if (actual.digest('hex') !== expected.digest('hex')) throw new Error(`Torn-tail repair verification failed for "${path}"`)
+      if (fileRevision(await stat(path, { bigint: true })) !== repair.revision) {
+        throw new Error(`Session log changed during torn-tail repair: "${path}"`)
+      }
+      /* v8 ignore next -- native Windows exercises write-through replacement; POSIX exercises rename and directory sync. */
+      if (process.platform === 'win32') {
+        await replaceFileWin32(tmp, path)
+      } else {
+        await rename(tmp, path)
+        await this.syncDirPosix(dirname(path))
+      }
+    } catch (error) {
+      await rm(tmp, { force: true })
+      throw error
     }
   }
 
